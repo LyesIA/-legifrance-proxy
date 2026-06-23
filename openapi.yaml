@@ -1,0 +1,184 @@
+openapi: 3.1.0
+info:
+  title: Legifrance Proxy
+  description: |
+    Accès simplifié à Légifrance (PISTE/DILA) via un proxy qui gère l'OAuth
+    en interne. Permet à ChatGPT de rechercher des codes, de la jurisprudence
+    et le Journal Officiel sans gérer le token client_credentials.
+  version: 1.0.0
+servers:
+  - url: https://REMPLACE-PAR-TON-DOMAINE.fly.dev
+    description: Production
+security:
+  - BearerAuth: []
+paths:
+  /search/code:
+    post:
+      operationId: searchCode
+      summary: Recherche full-text dans un code juridique français
+      description: |
+        Renvoie les articles correspondant à la requête dans le code spécifié
+        (Code civil, CESEDA, CPC, Code du travail, etc.).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query, code]
+              properties:
+                query:
+                  type: string
+                  description: Mots-clés ou expression à rechercher
+                  example: clause résolutoire bail habitation
+                code:
+                  type: string
+                  description: Nom exact du code
+                  example: Code civil
+                page_size:
+                  type: integer
+                  default: 10
+                  minimum: 1
+                  maximum: 50
+      responses:
+        "200":
+          description: Résultats Légifrance bruts
+          content:
+            application/json:
+              schema: { type: object }
+  /search/jurisprudence:
+    post:
+      operationId: searchJurisprudence
+      summary: Recherche dans la jurisprudence judiciaire (Cass + CA)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JurisprudenceSearch"
+      responses:
+        "200":
+          description: Résultats
+          content:
+            application/json:
+              schema: { type: object }
+  /search/juriadmin:
+    post:
+      operationId: searchJuriAdmin
+      summary: Recherche dans la jurisprudence administrative (CE, CAA, TA)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JurisprudenceSearch"
+      responses:
+        "200":
+          description: Résultats
+          content:
+            application/json:
+              schema: { type: object }
+  /search/jorf:
+    post:
+      operationId: searchJorf
+      summary: Recherche dans le Journal Officiel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                date_from:
+                  type: string
+                  format: date
+                date_to:
+                  type: string
+                  format: date
+                page_size:
+                  type: integer
+                  default: 10
+      responses:
+        "200":
+          description: Résultats
+          content:
+            application/json:
+              schema: { type: object }
+  /article/get:
+    post:
+      operationId: getArticle
+      summary: Récupère un article par son ID Légifrance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [article_id]
+              properties:
+                article_id:
+                  type: string
+                  example: LEGIARTI000006419279
+      responses:
+        "200":
+          description: Article complet
+          content:
+            application/json:
+              schema: { type: object }
+  /decision/get:
+    post:
+      operationId: getDecision
+      summary: Récupère une décision de justice par son ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision_id]
+              properties:
+                decision_id:
+                  type: string
+                  example: JURITEXT000048424123
+                fonds:
+                  type: string
+                  enum: [JURI, JURICA, CETAT, CONSTIT, CNIL, JUFI]
+                  default: JURI
+      responses:
+        "200":
+          description: Décision complète
+          content:
+            application/json:
+              schema: { type: object }
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    JurisprudenceSearch:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          example: rupture brutale relations commerciales
+        date_from:
+          type: string
+          format: date
+        date_to:
+          type: string
+          format: date
+        juridiction:
+          type: string
+          description: |
+            Filtre juridiction. Valeurs typiques :
+            - Judiciaire : "Cour de cassation", "cours d'appel"
+            - Administratif : "Conseil d'Etat", "Cours administratives d'appel"
+        page_size:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 50
