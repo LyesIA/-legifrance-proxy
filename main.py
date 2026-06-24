@@ -3,6 +3,12 @@ Proxy Légifrance pour ChatGPT Actions.
 
 Architecture :
   ChatGPT (Bearer token statique) -> Ce proxy -> OAuth PISTE -> API Légifrance
+
+Variables d'environnement Render :
+  PISTE_CLIENT_ID
+  PISTE_CLIENT_SECRET
+  PROXY_API_KEY
+  PISTE_ENV = sandbox ou prod
 """
 
 import os
@@ -36,7 +42,7 @@ else:
 app = FastAPI(
     title="Legifrance Proxy for ChatGPT",
     description="Proxy OAuth + endpoints simplifiés pour exposer Légifrance à ChatGPT Actions.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 security = HTTPBearer()
@@ -65,24 +71,47 @@ _token_cache: dict[str, Any] = {
 
 
 async def get_piste_token() -> str:
+    """
+    Récupère un access_token PISTE.
+
+    On tente d'abord l'authentification OAuth client_credentials avec HTTP Basic Auth.
+    Si PISTE refuse, on tente ensuite avec client_id/client_secret dans le body.
+    """
     now = time.time()
 
     if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
         return _token_cache["token"]
 
     async with httpx.AsyncClient(timeout=20.0) as client:
+        # Méthode 1 : HTTP Basic Auth
         resp = await client.post(
             PISTE_OAUTH_URL,
             data={
                 "grant_type": "client_credentials",
-                "client_id": PISTE_CLIENT_ID,
-                "client_secret": PISTE_CLIENT_SECRET,
                 "scope": "openid",
             },
+            auth=(PISTE_CLIENT_ID, PISTE_CLIENT_SECRET),
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
             },
         )
+
+        # Méthode 2 : client_id / client_secret dans le body
+        if resp.status_code != 200:
+            resp = await client.post(
+                PISTE_OAUTH_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": PISTE_CLIENT_ID,
+                    "client_secret": PISTE_CLIENT_SECRET,
+                    "scope": "openid",
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+            )
 
     if resp.status_code != 200:
         raise HTTPException(
@@ -91,8 +120,8 @@ async def get_piste_token() -> str:
         )
 
     data = resp.json()
-
     access_token = data.get("access_token")
+
     if not access_token:
         raise HTTPException(
             status_code=502,
@@ -106,6 +135,7 @@ async def get_piste_token() -> str:
 
 
 async def piste_call(path: str, payload: dict) -> dict:
+    """Appel POST authentifié à l'API PISTE Légifrance."""
     token = await get_piste_token()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -129,12 +159,15 @@ async def piste_call(path: str, payload: dict) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# Modèles
+# Modèles d'entrée
 # ----------------------------------------------------------------------------
 
 class CodeSearchIn(BaseModel):
     query: str = Field(..., description="Mots-clés ou expression à rechercher")
-    code: str = Field(..., description="Nom du code : Code civil, Code de procédure civile, CESEDA...")
+    code: str = Field(
+        ...,
+        description="Nom du code : Code civil, Code de procédure civile, CESEDA...",
+    )
     page_size: int = Field(10, ge=1, le=50)
 
 
@@ -163,7 +196,7 @@ class DecisionGetIn(BaseModel):
 
 
 # ----------------------------------------------------------------------------
-# Payloads PISTE
+# Helpers payload PISTE
 # ----------------------------------------------------------------------------
 
 def _search_payload(
@@ -201,6 +234,14 @@ def _search_payload(
 # Endpoints
 # ----------------------------------------------------------------------------
 
+@app.get("/")
+async def root() -> dict:
+    return {
+        "ok": True,
+        "message": "Proxy Légifrance actif. Utilise /healthz ou /docs.",
+    }
+
+
 @app.get("/healthz")
 async def healthz() -> dict:
     return {
@@ -212,6 +253,7 @@ async def healthz() -> dict:
 
 @app.post("/search/code", dependencies=[Depends(check_api_key)])
 async def search_code(body: CodeSearchIn) -> dict:
+    """Recherche full-text dans un code spécifique."""
     payload = _search_payload(
         fond="CODE_DATE",
         query=body.query,
@@ -233,6 +275,7 @@ async def search_code(body: CodeSearchIn) -> dict:
 
 @app.post("/search/jurisprudence", dependencies=[Depends(check_api_key)])
 async def search_jurisprudence(body: JurisprudenceSearchIn) -> dict:
+    """Jurisprudence judiciaire."""
     filters: list[dict] = []
 
     if body.date_from or body.date_to:
@@ -266,6 +309,7 @@ async def search_jurisprudence(body: JurisprudenceSearchIn) -> dict:
 
 @app.post("/search/juriadmin", dependencies=[Depends(check_api_key)])
 async def search_juriadmin(body: JurisprudenceSearchIn) -> dict:
+    """Jurisprudence administrative."""
     filters: list[dict] = []
 
     if body.date_from or body.date_to:
@@ -299,6 +343,7 @@ async def search_juriadmin(body: JurisprudenceSearchIn) -> dict:
 
 @app.post("/search/jorf", dependencies=[Depends(check_api_key)])
 async def search_jorf(body: JorfSearchIn) -> dict:
+    """Recherche au Journal officiel."""
     filters: list[dict] = []
 
     if body.date_from or body.date_to:
@@ -324,6 +369,7 @@ async def search_jorf(body: JorfSearchIn) -> dict:
 
 @app.post("/article/get", dependencies=[Depends(check_api_key)])
 async def article_get(body: ArticleGetIn) -> dict:
+    """Récupère un article par son ID Légifrance."""
     return await piste_call(
         "/consult/getArticle",
         {
@@ -334,6 +380,7 @@ async def article_get(body: ArticleGetIn) -> dict:
 
 @app.post("/decision/get", dependencies=[Depends(check_api_key)])
 async def decision_get(body: DecisionGetIn) -> dict:
+    """Récupère une décision par son ID."""
     fonds = body.fonds.upper()
 
     endpoint = {
