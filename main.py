@@ -1,5 +1,5 @@
 """
-Proxy Légifrance pour ChatGPT Actions.
+Proxy Légifrance pour ChatGPT Actions - Version Cabinet avancée.
 
 Architecture :
   ChatGPT (Bearer token statique) -> Ce proxy -> OAuth PISTE -> API Légifrance
@@ -8,7 +8,7 @@ Variables d'environnement Render :
   PISTE_CLIENT_ID
   PISTE_CLIENT_SECRET
   PROXY_API_KEY
-  PISTE_ENV = sandbox ou prod
+  PISTE_ENV = prod ou sandbox
 """
 
 import os
@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -40,9 +41,9 @@ else:
 
 
 app = FastAPI(
-    title="Legifrance Proxy for ChatGPT",
-    description="Proxy OAuth + endpoints simplifiés pour exposer Légifrance à ChatGPT Actions.",
-    version="1.1.0",
+    title="Legifrance Proxy Cabinet DARMON",
+    description="Proxy OAuth + endpoints juridiques avancés pour exposer Légifrance à ChatGPT Actions.",
+    version="2.0.0",
 )
 
 security = HTTPBearer()
@@ -74,8 +75,8 @@ async def get_piste_token() -> str:
     """
     Récupère un access_token PISTE.
 
-    On tente d'abord l'authentification OAuth client_credentials avec HTTP Basic Auth.
-    Si PISTE refuse, on tente ensuite avec client_id/client_secret dans le body.
+    Méthode principale : OAuth client_credentials en HTTP Basic Auth.
+    Fallback : client_id/client_secret dans le body.
     """
     now = time.time()
 
@@ -83,7 +84,6 @@ async def get_piste_token() -> str:
         return _token_cache["token"]
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-        # Méthode 1 : HTTP Basic Auth
         resp = await client.post(
             PISTE_OAUTH_URL,
             data={
@@ -97,7 +97,6 @@ async def get_piste_token() -> str:
             },
         )
 
-        # Méthode 2 : client_id / client_secret dans le body
         if resp.status_code != 200:
             resp = await client.post(
                 PISTE_OAUTH_URL,
@@ -158,16 +157,31 @@ async def piste_call(path: str, payload: dict) -> dict:
     return resp.json()
 
 
+async def safe_piste_call(path: str, payload: dict) -> dict:
+    """Appel PISTE qui ne casse pas une recherche globale si un fond échoue."""
+    try:
+        return await piste_call(path, payload)
+    except HTTPException as exc:
+        return {
+            "error": True,
+            "status_code": exc.status_code,
+            "detail": exc.detail,
+        }
+    except Exception as exc:
+        return {
+            "error": True,
+            "status_code": 500,
+            "detail": str(exc),
+        }
+
+
 # ----------------------------------------------------------------------------
 # Modèles d'entrée
 # ----------------------------------------------------------------------------
 
 class CodeSearchIn(BaseModel):
-    query: str = Field(..., description="Mots-clés ou expression à rechercher")
-    code: str = Field(
-        ...,
-        description="Nom du code : Code civil, Code de procédure civile, CESEDA...",
-    )
+    query: str = Field(..., description="Mots-clés, expression ou numéro d'article à rechercher")
+    code: str = Field(..., description="Nom du code : Code civil, Code du travail, CESEDA, CPC...")
     page_size: int = Field(10, ge=1, le=50)
 
 
@@ -193,6 +207,24 @@ class ArticleGetIn(BaseModel):
 class DecisionGetIn(BaseModel):
     decision_id: str = Field(..., description="ID de décision Légifrance")
     fonds: str = Field("JURI", description="JURI, JURICA, CETAT, CONSTIT, CNIL, JUFI")
+
+
+class GlobalSearchIn(BaseModel):
+    query: str = Field(..., description="Question, notion, mots-clés ou expression juridique")
+    code: str | None = Field(None, description="Code à interroger si pertinent")
+    include_code: bool = Field(True, description="Inclure une recherche dans un code")
+    include_judicial: bool = Field(True, description="Inclure jurisprudence judiciaire")
+    include_admin: bool = Field(True, description="Inclure jurisprudence administrative")
+    include_jorf: bool = Field(False, description="Inclure JORF")
+    date_from: str | None = Field(None, description="Date min YYYY-MM-DD")
+    date_to: str | None = Field(None, description="Date max YYYY-MM-DD")
+    page_size: int = Field(5, ge=1, le=20)
+
+
+class LegalResearchIn(BaseModel):
+    question: str = Field(..., description="Question juridique à rechercher")
+    domain: str | None = Field(None, description="Domaine : civil, travail, étranger, pénal, administratif, médical...")
+    page_size: int = Field(5, ge=1, le=20)
 
 
 # ----------------------------------------------------------------------------
@@ -230,16 +262,68 @@ def _search_payload(
     }
 
 
+def _date_filter(facette: str, date_from: str | None, date_to: str | None) -> list[dict]:
+    if not date_from and not date_to:
+        return []
+    return [
+        {
+            "facette": facette,
+            "dates": {
+                "start": date_from or "1900-01-01",
+                "end": date_to or "2099-12-31",
+            },
+        }
+    ]
+
+
+def _infer_code(domain: str | None, question: str) -> str:
+    text = f"{domain or ''} {question}".lower()
+
+    if any(x in text for x in ["étranger", "etranger", "oqtf", "titre de séjour", "sejour", "ceseda", "préfecture", "prefecture"]):
+        return "Code de l'entrée et du séjour des étrangers et du droit d'asile"
+    if any(x in text for x in ["travail", "salarié", "salarie", "licenciement", "faute grave", "prud'hommes", "prudhommes"]):
+        return "Code du travail"
+    if any(x in text for x in ["pénal", "penal", "infraction", "garde à vue", "correctionnel"]):
+        return "Code pénal"
+    if any(x in text for x in ["procédure civile", "procedure civile", "assignation", "référé", "refere", "cpc"]):
+        return "Code de procédure civile"
+    if any(x in text for x in ["administratif", "conseil d'etat", "conseil d'état", "tribunal administratif", "caa"]):
+        return "Code de justice administrative"
+    if any(x in text for x in ["commerce", "société", "societe", "bail commercial"]):
+        return "Code de commerce"
+
+    return "Code civil"
+
+
 # ----------------------------------------------------------------------------
-# Endpoints
+# Endpoints généraux
 # ----------------------------------------------------------------------------
 
 @app.get("/")
 async def root() -> dict:
     return {
         "ok": True,
-        "message": "Proxy Légifrance actif. Utilise /healthz ou /docs.",
+        "message": "Proxy Légifrance Cabinet DARMON actif. Utilise /healthz ou /docs.",
+        "version": "2.0.0",
     }
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy() -> str:
+    return """
+    <html>
+      <head>
+        <title>Privacy Policy - Proxy Légifrance Cabinet DARMON</title>
+        <meta charset="utf-8" />
+      </head>
+      <body>
+        <h1>Privacy Policy</h1>
+        <p>This service is used only to query the French Légifrance API through PISTE.</p>
+        <p>No personal data is stored, sold or shared by this proxy.</p>
+        <p>Requests are transmitted to Légifrance only for legal research purposes.</p>
+      </body>
+    </html>
+    """
 
 
 @app.get("/healthz")
@@ -248,12 +332,16 @@ async def healthz() -> dict:
         "ok": True,
         "env": PISTE_ENV,
         "piste_base": PISTE_BASE,
+        "version": "2.0.0",
     }
 
 
+# ----------------------------------------------------------------------------
+# Endpoints de recherche simples
+# ----------------------------------------------------------------------------
+
 @app.post("/search/code", dependencies=[Depends(check_api_key)])
 async def search_code(body: CodeSearchIn) -> dict:
-    """Recherche full-text dans un code spécifique."""
     payload = _search_payload(
         fond="CODE_DATE",
         query=body.query,
@@ -275,19 +363,8 @@ async def search_code(body: CodeSearchIn) -> dict:
 
 @app.post("/search/jurisprudence", dependencies=[Depends(check_api_key)])
 async def search_jurisprudence(body: JurisprudenceSearchIn) -> dict:
-    """Jurisprudence judiciaire."""
     filters: list[dict] = []
-
-    if body.date_from or body.date_to:
-        filters.append(
-            {
-                "facette": "DATE_DECISION",
-                "dates": {
-                    "start": body.date_from or "1900-01-01",
-                    "end": body.date_to or "2099-12-31",
-                },
-            }
-        )
+    filters.extend(_date_filter("DATE_DECISION", body.date_from, body.date_to))
 
     if body.juridiction:
         filters.append(
@@ -309,19 +386,8 @@ async def search_jurisprudence(body: JurisprudenceSearchIn) -> dict:
 
 @app.post("/search/juriadmin", dependencies=[Depends(check_api_key)])
 async def search_juriadmin(body: JurisprudenceSearchIn) -> dict:
-    """Jurisprudence administrative."""
     filters: list[dict] = []
-
-    if body.date_from or body.date_to:
-        filters.append(
-            {
-                "facette": "DATE_DECISION",
-                "dates": {
-                    "start": body.date_from or "1900-01-01",
-                    "end": body.date_to or "2099-12-31",
-                },
-            }
-        )
+    filters.extend(_date_filter("DATE_DECISION", body.date_from, body.date_to))
 
     if body.juridiction:
         filters.append(
@@ -343,19 +409,8 @@ async def search_juriadmin(body: JurisprudenceSearchIn) -> dict:
 
 @app.post("/search/jorf", dependencies=[Depends(check_api_key)])
 async def search_jorf(body: JorfSearchIn) -> dict:
-    """Recherche au Journal officiel."""
     filters: list[dict] = []
-
-    if body.date_from or body.date_to:
-        filters.append(
-            {
-                "facette": "DATE_PUBLICATION",
-                "dates": {
-                    "start": body.date_from or "1900-01-01",
-                    "end": body.date_to or "2099-12-31",
-                },
-            }
-        )
+    filters.extend(_date_filter("DATE_PUBLICATION", body.date_from, body.date_to))
 
     payload = _search_payload(
         fond="JORF",
@@ -369,7 +424,6 @@ async def search_jorf(body: JorfSearchIn) -> dict:
 
 @app.post("/article/get", dependencies=[Depends(check_api_key)])
 async def article_get(body: ArticleGetIn) -> dict:
-    """Récupère un article par son ID Légifrance."""
     return await piste_call(
         "/consult/getArticle",
         {
@@ -380,7 +434,6 @@ async def article_get(body: ArticleGetIn) -> dict:
 
 @app.post("/decision/get", dependencies=[Depends(check_api_key)])
 async def decision_get(body: DecisionGetIn) -> dict:
-    """Récupère une décision par son ID."""
     fonds = body.fonds.upper()
 
     endpoint = {
@@ -404,3 +457,125 @@ async def decision_get(body: DecisionGetIn) -> dict:
         payload = {"id": body.decision_id}
 
     return await piste_call(endpoint, payload)
+
+
+# ----------------------------------------------------------------------------
+# Endpoints avancés pour GPT juridique
+# ----------------------------------------------------------------------------
+
+@app.post("/search/global", dependencies=[Depends(check_api_key)])
+async def search_global(body: GlobalSearchIn) -> dict:
+    """
+    Recherche transversale : code + jurisprudence judiciaire + jurisprudence administrative + JORF.
+    Retourne les résultats par source, même si une source échoue.
+    """
+    output: dict[str, Any] = {
+        "query": body.query,
+        "environment": PISTE_ENV,
+        "results": {},
+    }
+
+    if body.include_code:
+        code_name = body.code or _infer_code(None, body.query)
+        code_payload = _search_payload(
+            fond="CODE_DATE",
+            query=body.query,
+            page_size=body.page_size,
+            filters=[
+                {
+                    "facette": "NOM_CODE",
+                    "valeurs": [code_name],
+                },
+                {
+                    "facette": "DATE_VERSION",
+                    "singleDate": int(time.time() * 1000),
+                },
+            ],
+        )
+        output["results"]["code"] = {
+            "code": code_name,
+            "data": await safe_piste_call("/search", code_payload),
+        }
+
+    if body.include_judicial:
+        judicial_payload = _search_payload(
+            fond="JURI",
+            query=body.query,
+            page_size=body.page_size,
+            filters=_date_filter("DATE_DECISION", body.date_from, body.date_to),
+        )
+        output["results"]["jurisprudence_judiciaire"] = await safe_piste_call("/search", judicial_payload)
+
+    if body.include_admin:
+        admin_payload = _search_payload(
+            fond="CETAT",
+            query=body.query,
+            page_size=body.page_size,
+            filters=_date_filter("DATE_DECISION", body.date_from, body.date_to),
+        )
+        output["results"]["jurisprudence_administrative"] = await safe_piste_call("/search", admin_payload)
+
+    if body.include_jorf:
+        jorf_payload = _search_payload(
+            fond="JORF",
+            query=body.query,
+            page_size=body.page_size,
+            filters=_date_filter("DATE_PUBLICATION", body.date_from, body.date_to),
+        )
+        output["results"]["jorf"] = await safe_piste_call("/search", jorf_payload)
+
+    return output
+
+
+@app.post("/research/legal", dependencies=[Depends(check_api_key)])
+async def legal_research(body: LegalResearchIn) -> dict:
+    """
+    Recherche juridique intelligente pour GPT :
+    - infère le code utile ;
+    - recherche dans le code ;
+    - recherche en jurisprudence judiciaire ;
+    - recherche en jurisprudence administrative.
+    """
+    code_name = _infer_code(body.domain, body.question)
+
+    code_payload = _search_payload(
+        fond="CODE_DATE",
+        query=body.question,
+        page_size=body.page_size,
+        filters=[
+            {
+                "facette": "NOM_CODE",
+                "valeurs": [code_name],
+            },
+            {
+                "facette": "DATE_VERSION",
+                "singleDate": int(time.time() * 1000),
+            },
+        ],
+    )
+
+    judicial_payload = _search_payload(
+        fond="JURI",
+        query=body.question,
+        page_size=body.page_size,
+        filters=[],
+    )
+
+    admin_payload = _search_payload(
+        fond="CETAT",
+        query=body.question,
+        page_size=body.page_size,
+        filters=[],
+    )
+
+    return {
+        "question": body.question,
+        "domain": body.domain,
+        "inferred_code": code_name,
+        "environment": PISTE_ENV,
+        "results": {
+            "code": await safe_piste_call("/search", code_payload),
+            "jurisprudence_judiciaire": await safe_piste_call("/search", judicial_payload),
+            "jurisprudence_administrative": await safe_piste_call("/search", admin_payload),
+        },
+    }
